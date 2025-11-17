@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -212,8 +213,28 @@ func (pc *ParallelCrawler) worker(id int, wg *sync.WaitGroup) {
 		pc.markURLVisited(job.URL)
 		pc.incrementProcessed()
 
-		// Fetch (your original logic)
-		res, err := client.Get(job.URL)
+		// Create request with proper headers
+		req, err := http.NewRequest("GET", job.URL, nil)
+		if err != nil {
+			pc.results <- CrawlResult{URL: job.URL, Error: err, WorkerID: id}
+			pc.metrics.mu.Lock()
+			pc.metrics.Errors++
+			pc.metrics.mu.Unlock()
+			pc.decrementActiveWorkers()
+			continue
+		}
+
+		// Add browser-like headers
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+		req.Header.Set("Cache-Control", "max-age=0")
+
+		// Execute request
+		res, err := client.Do(req)
 		var body []byte
 		var links []string
 
@@ -228,7 +249,21 @@ func (pc *ParallelCrawler) worker(id int, wg *sync.WaitGroup) {
 
 		func() {
 			defer res.Body.Close()
-			body, _ = io.ReadAll(res.Body)
+			// Handle gzip compressed responses
+			var reader io.ReadCloser
+			switch strings.ToLower(res.Header.Get("Content-Encoding")) {
+			case "gzip":
+				gzipReader, err := gzip.NewReader(res.Body)
+				if err != nil {
+					body, _ = io.ReadAll(res.Body) // Fallback to original
+					return
+				}
+				reader = gzipReader
+			default:
+				reader = res.Body
+			}
+			defer reader.Close()
+			body, _ = io.ReadAll(reader)
 		}()
 		bytesLen := len(body)
 
@@ -402,7 +437,24 @@ func SerialCrawl(urls []string) *Metrics {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	for _, u := range urls {
-		res, err := client.Get(u)
+		// Create request with proper headers
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			metrics.Errors++
+			fmt.Printf("Serial error creating request for %s: %v\n", u, err)
+			continue
+		}
+
+		// Add browser-like headers
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+		req.Header.Set("Cache-Control", "max-age=0")
+
+		res, err := client.Do(req)
 		if err != nil {
 			metrics.Errors++
 			fmt.Printf("Serial error on %s: %v\n", u, err)
@@ -410,7 +462,23 @@ func SerialCrawl(urls []string) *Metrics {
 		}
 		defer res.Body.Close()
 
-		body, _ := io.ReadAll(res.Body)
+		// Handle gzip compressed responses
+		var reader io.ReadCloser
+		switch strings.ToLower(res.Header.Get("Content-Encoding")) {
+		case "gzip":
+			gzipReader, err := gzip.NewReader(res.Body)
+			if err != nil {
+				body, _ := io.ReadAll(res.Body) // Fallback
+				fmt.Printf("Serial fetched %d bytes from %s\n", len(body), u)
+				continue
+			}
+			reader = gzipReader
+		default:
+			reader = res.Body
+		}
+		defer reader.Close()
+
+		body, _ := io.ReadAll(reader)
 		fmt.Printf("Serial fetched %d bytes from %s\n", len(body), u)
 
 		metrics.TotalVisited++
